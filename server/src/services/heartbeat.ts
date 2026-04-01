@@ -821,6 +821,94 @@ function normalizeSessionParams(params: Record<string, unknown> | null | undefin
   return Object.keys(params).length > 0 ? params : null;
 }
 
+function detectSessionNotFoundError(adapterResult: AdapterExecutionResult): {
+  isSessionNotFound: boolean;
+  rootCause: "deleted" | "access_denied" | "unknown";
+  previousSessionId: string | null;
+} | null {
+  if (!adapterResult.clearSession) {
+    return null;
+  }
+
+  const errorMessage = adapterResult.errorMessage ?? "";
+  const errorMeta = adapterResult.errorMeta ?? {};
+  const sessionId = adapterResult.sessionId ?? adapterResult.sessionParams?.["sessionId"] ?? null;
+
+  const sessionNotFoundPatterns = [
+    /session\s+not\s+found/i,
+    /unknown\s+session/i,
+    /session\s+.*\s+not\s+found/i,
+    /no\s+session/i,
+    /missing\s+session/i,
+    /session\s+deleted/i,
+    /conversation\s+not\s+found/i,
+    /thread\s+not\s+found/i,
+    /chat\s+not\s+found/i,
+  ];
+
+  const isSessionNotFound = sessionNotFoundPatterns.some((pattern) => pattern.test(errorMessage));
+
+  if (!isSessionNotFound) {
+    return null;
+  }
+
+  const accessDeniedPatterns = [
+    /permission\s+denied/i,
+    /access\s+denied/i,
+    /not\s+authorized/i,
+    /unauthorized/i,
+    /forbidden/i,
+  ];
+
+  const isAccessDenied = accessDeniedPatterns.some((pattern) => pattern.test(errorMessage));
+  const rootCause: "deleted" | "access_denied" | "unknown" = isAccessDenied ? "access_denied" : "deleted";
+
+  return {
+    isSessionNotFound: true,
+    rootCause,
+    previousSessionId: sessionId,
+  };
+}
+
+async function fetchIssueContextForRecovery(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<{ title: string; description: string | null; identifier: string } | null> {
+  const issue = await db
+    .select({
+      id: issues.id,
+      identifier: issues.identifier,
+      title: issues.title,
+      description: issues.description,
+    })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+
+  if (!issue) {
+    return null;
+  }
+
+  return {
+    title: issue.title,
+    description: issue.description,
+    identifier: issue.identifier,
+  };
+}
+
+function buildSessionRecoveryHandoff(issueContext: { title: string; description: string | null; identifier: string }, rootCause: string): string {
+  const parts = [
+    "Paperclip session recovery:",
+    `- Issue: ${issueContext.identifier}: ${issueContext.title}`,
+    `- Session not found, root cause: ${rootCause}`,
+    issueContext.description ? `- Issue description: ${issueContext.description.substring(0, 500)}${issueContext.description.length > 500 ? "..." : ""}` : "",
+    "The previous session was lost. Resume work on this issue from the current state. Rebuild only the minimum context you need.",
+  ].filter(Boolean);
+
+  return parts.join("\n");
+}
+
 function resolveNextSessionState(input: {
   codec: AdapterSessionCodec;
   adapterResult: AdapterExecutionResult;
@@ -2470,6 +2558,18 @@ export function heartbeatService(db: Db) {
       delete context.paperclipPreviousSessionId;
     }
 
+    const hasRecoveryHandoff = context.paperclipSessionRecoveryHandoff && !runtimeSessionIdForAdapter && !previousSessionDisplayId;
+    if (hasRecoveryHandoff) {
+      context.paperclipSessionHandoffMarkdown = context.paperclipSessionRecoveryHandoff;
+      context.paperclipSessionRotationReason = context.paperclipSessionRecoveryReason ?? "session_not_found";
+      context.paperclipPreviousSessionId = context.paperclipPreviousSessionId;
+      runtimeWorkspaceWarnings.push(
+        `Starting a fresh session due to session not found (${context.paperclipSessionRecoveryReason}). Recovery context from issue will be provided.`,
+      );
+      delete context.paperclipSessionRecoveryHandoff;
+      delete context.paperclipSessionRecoveryReason;
+    }
+
     const runtimeForAdapter = {
       sessionId: runtimeSessionIdForAdapter,
       sessionParams: runtimeSessionParamsForAdapter,
@@ -2722,6 +2822,26 @@ export function heartbeatService(db: Db) {
         previousDisplayId: runtimeForAdapter.sessionDisplayId,
         previousLegacySessionId: runtimeForAdapter.sessionId,
       });
+
+      const sessionNotFoundInfo = detectSessionNotFoundError(adapterResult);
+      if (sessionNotFoundInfo && issueId) {
+        const issueContext = await fetchIssueContextForRecovery(db, agent.companyId, issueId);
+        if (issueContext) {
+          const recoveryHandoff = buildSessionRecoveryHandoff(issueContext, sessionNotFoundInfo.rootCause);
+          context.paperclipSessionRecoveryHandoff = recoveryHandoff;
+          context.paperclipSessionRecoveryReason = `session_not_found_${sessionNotFoundInfo.rootCause}`;
+          context.paperclipPreviousSessionId = sessionNotFoundInfo.previousSessionId;
+          await onLog(
+            "stdout",
+            `[paperclip] Session not found (${sessionNotFoundInfo.rootCause}); prepared recovery context from issue ${issueContext.identifier}\n`,
+          );
+        }
+      } else {
+        delete context.paperclipSessionRecoveryHandoff;
+        delete context.paperclipSessionRecoveryReason;
+        delete context.paperclipPreviousSessionId;
+      }
+
       const rawUsage = normalizeUsageTotals(adapterResult.usage);
       const sessionUsageResolution = await resolveNormalizedUsageForSession({
         agentId: agent.id,
@@ -2810,6 +2930,7 @@ export function heartbeatService(db: Db) {
         logBytes: logSummary?.bytes,
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
+        contextSnapshot: context,
       });
 
       await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
