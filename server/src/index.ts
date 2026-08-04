@@ -42,12 +42,16 @@ import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import {
   feedbackService,
   applyManagedEnvironments,
+  attentionService,
   backfillPrincipalAccessCompatibility,
   backfillLegacyToolOAuthTokens,
   bootstrapExecutionPolicyFromEnv,
   environmentCustomImageService,
   decisionService,
+  decisionRetentionService,
+  externalObjectService,
   heartbeatService,
+  issueThreadInteractionService,
   issueService,
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
@@ -73,7 +77,7 @@ import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
-import { createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
+import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
 import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
@@ -558,6 +562,11 @@ export async function startServer(): Promise<StartedServer> {
   if (toolOAuthBackfill.sanitizedConnections > 0 || toolOAuthBackfill.migratedConnections > 0) {
     logger.info(toolOAuthBackfill, "Backfilled legacy tool OAuth credentials into company secrets");
   }
+  const confirmationSweep = await issueThreadInteractionService(db as any)
+    .sweepSupersededPendingRequestConfirmations();
+  if (confirmationSweep.expired > 0) {
+    logger.info(confirmationSweep, "Expired pending confirmations superseded by newer agent requests");
+  }
   if (config.deploymentMode === "authenticated") {
     const {
       createBetterAuthHandler,
@@ -910,9 +919,33 @@ export async function startServer(): Promise<StartedServer> {
       await Promise.allSettled([...heartbeatSchedulerInFlight]);
     }
   };
+  const startHeartbeatSchedulerInterval = (callback: () => void) => {
+    heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
+    heartbeatSchedulerInterval?.unref?.();
+  };
+  const externalObjects = externalObjectService(db as any, {
+    pluginWorkerManager,
+    enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,
+  });
+  const scheduleExternalObjectRefreshSweep = (now = new Date()) => {
+    if (heartbeatSchedulerStopped) return;
+    trackHeartbeatSchedulerWork(externalObjects
+      .refreshDueObjectsForActiveCompanies(50, now)
+      .then((result) => {
+        if (result.checked > 0 || result.refreshed > 0) {
+          logger.info({ ...result }, "external-object scheduler tick refreshed due objects");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "external-object scheduler tick failed");
+      }));
+  };
 
   if (heartbeat) {
     const decisionExecutor = decisionService(db as any, decisionServiceOptions);
+    const retentionExecutor = decisionRetentionService(db as any, {
+      notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
+    });
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
@@ -1046,8 +1079,29 @@ export async function startServer(): Promise<StartedServer> {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
     await decisionExecutor.sweepExpired();
+    const runRetentionSweep = async () => {
+      const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
+      let archived = 0;
+      for (const company of activeCompanies) {
+        const items = [];
+        let cursor: string | undefined;
+        do {
+          const page = await attentionService(db as any).list(company.id, {
+            includeDismissed: true,
+            limit: 100,
+            cursor,
+          });
+          items.push(...page.items);
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+        archived += await retentionExecutor.autoArchive({ companyId: company.id, items });
+      }
+      const notifications = await retentionExecutor.deliverNotifications();
+      return { archived, ...notifications };
+    };
+    await runRetentionSweep();
 
-    heartbeatSchedulerInterval = setInterval(() => {
+    startHeartbeatSchedulerInterval(() => {
       // Async so the suppression checks below can honor the override-aware
       // resolver (e.g. worktree run-execution opt-in). The gated work is still
       // wrapped in trackHeartbeatSchedulerWork with its own error handling.
@@ -1055,6 +1109,9 @@ export async function startServer(): Promise<StartedServer> {
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(decisionExecutor.sweepExpired().catch((err: unknown) => {
           logger.error({ err }, "decision expiry sweep failed");
+        }));
+        trackHeartbeatSchedulerWork(runRetentionSweep().catch((err: unknown) => {
+          logger.error({ err }, "decision retention sweep failed");
         }));
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
@@ -1076,6 +1133,9 @@ export async function startServer(): Promise<StartedServer> {
               logger.error({ err }, "heartbeat timer tick failed");
             }));
         }
+
+        if (heartbeatSchedulerStopped) return;
+        scheduleExternalObjectRefreshSweep(new Date());
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
@@ -1201,7 +1261,11 @@ export async function startServer(): Promise<StartedServer> {
             }));
         }
       })();
-    }, config.heartbeatSchedulerIntervalMs);
+    });
+  } else {
+    startHeartbeatSchedulerInterval(() => {
+      scheduleExternalObjectRefreshSweep(new Date());
+    });
   }
   
   if (config.databaseBackupEnabled) {

@@ -115,7 +115,12 @@ import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recover
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
-import { logActivity } from "./activity-log.js";
+import {
+  logActivity,
+  persistActivity,
+  publishActivity,
+  type ActivityPublication,
+} from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
@@ -300,6 +305,7 @@ function buildReusedExecutionWorkspaceConfigPatchFromIssueSettings(
   return {
     environmentId: settings?.environmentId ?? null,
     provisionCommand: settings?.workspaceStrategy?.provisionCommand ?? null,
+    runtimeProvisionCommand: settings?.workspaceStrategy?.runtimeProvisionCommand ?? null,
     teardownCommand: settings?.workspaceStrategy?.teardownCommand ?? null,
     workspaceRuntime: settings?.workspaceRuntime ?? null,
   };
@@ -325,6 +331,9 @@ function buildPreRealizationExecutionWorkspaceSettings(raw: unknown): Record<str
       ...(settings.workspaceStrategy.branchTemplate ? { branchTemplate: settings.workspaceStrategy.branchTemplate } : {}),
       ...(settings.workspaceStrategy.worktreeParentDir ? { worktreeParentDir: settings.workspaceStrategy.worktreeParentDir } : {}),
       ...(settings.workspaceStrategy.provisionCommand ? { provisionCommand: settings.workspaceStrategy.provisionCommand } : {}),
+      ...(settings.workspaceStrategy.runtimeProvisionCommand
+        ? { runtimeProvisionCommand: settings.workspaceStrategy.runtimeProvisionCommand }
+        : {}),
       ...(settings.workspaceStrategy.teardownCommand ? { teardownCommand: settings.workspaceStrategy.teardownCommand } : {}),
     };
   }
@@ -1564,6 +1573,11 @@ function inboxVisibleForUserCondition(companyId: string, userId: string) {
               AND ${activityLog.details}->>'status' IN ('in_review', 'blocked', 'done')
               AND ${activityLog.details}->'_previous'->>'status'
                 IS DISTINCT FROM ${activityLog.details}->>'status'
+              AND NOT (
+                ${activityLog.details}->>'status' = 'done'
+                AND ${issues.completedAt} IS NOT NULL
+                AND ${issueInboxArchives.archivedAt} >= ${issues.completedAt}
+              )
           )
           OR EXISTS (
             SELECT 1
@@ -1865,8 +1879,8 @@ function lowTrustBoundaryIssueCondition(
 }
 
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
-const BLOCKER_ATTENTION_MAX_DEPTH = 8;
-const BLOCKER_ATTENTION_MAX_NODES = 2000;
+export const BLOCKER_ATTENTION_MAX_DEPTH = 8;
+export const BLOCKER_ATTENTION_MAX_NODES = 2000;
 const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
 
 type IssueBlockerAttentionNode = {
@@ -2035,6 +2049,8 @@ function createIssueBlockerAttention(input: Partial<IssueBlockerAttention> = {})
     pendingFinalizeBlockerIssueIds: input.pendingFinalizeBlockerIssueIds ?? [],
     sampleBlockerIdentifier: input.sampleBlockerIdentifier ?? null,
     sampleStalledBlockerIdentifier: input.sampleStalledBlockerIdentifier ?? null,
+    blockingTreeLive: input.blockingTreeLive ?? false,
+    terminalBlockerIssueId: input.terminalBlockerIssueId ?? null,
   };
 }
 
@@ -2520,6 +2536,7 @@ async function listIssueBlockerAttentionMap(
     stalled: boolean;
     sampleBlockerIdentifier: string | null;
     sampleStalledBlockerIdentifier: string | null;
+    terminalBlockerIssueId?: string | null;
   };
   const classifyPath = (
     nodeId: string,
@@ -2548,16 +2565,34 @@ async function listIssueBlockerAttentionMap(
       if (hasWaitingPath) {
         return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
       }
-      return { covered: false, stalled: true, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: nodeSample };
+      return {
+        covered: false,
+        stalled: true,
+        sampleBlockerIdentifier: nodeSample,
+        sampleStalledBlockerIdentifier: nodeSample,
+        terminalBlockerIssueId: node.id,
+      };
     }
     if (activeIssueIds.has(node.id)) {
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
     if (node.status === "cancelled") {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+      return {
+        covered: false,
+        stalled: false,
+        sampleBlockerIdentifier: nodeSample,
+        sampleStalledBlockerIdentifier: null,
+        terminalBlockerIssueId: node.id,
+      };
     }
     if (node.status === "backlog" && node.assigneeAgentId) {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+      return {
+        covered: false,
+        stalled: false,
+        sampleBlockerIdentifier: nodeSample,
+        sampleStalledBlockerIdentifier: null,
+        terminalBlockerIssueId: node.id,
+      };
     }
 
     const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => {
@@ -2570,13 +2605,16 @@ async function listIssueBlockerAttentionMap(
       const classified = downstream.map((edge) => classifyPath(edge.blockerIssueId, nextSeen));
       const stalledChild = classified.find((result) => result.stalled || result.sampleStalledBlockerIdentifier);
       const sampleStalled = stalledChild?.sampleStalledBlockerIdentifier ?? null;
-      const hardAttention = classified.find((result) => !result.covered && !result.stalled);
+      const hardAttention = classified.find((result) =>
+        !result.covered && !result.stalled && result.terminalBlockerIssueId
+      ) ?? classified.find((result) => !result.covered && !result.stalled);
       if (hardAttention) {
         return {
           covered: false,
           stalled: false,
           sampleBlockerIdentifier: hardAttention.sampleBlockerIdentifier,
           sampleStalledBlockerIdentifier: sampleStalled,
+          terminalBlockerIssueId: hardAttention.terminalBlockerIssueId ?? null,
         };
       }
       const stalledEntry = classified.find((result) => result.stalled);
@@ -2586,6 +2624,7 @@ async function listIssueBlockerAttentionMap(
           stalled: true,
           sampleBlockerIdentifier: stalledEntry.sampleBlockerIdentifier,
           sampleStalledBlockerIdentifier: sampleStalled,
+          terminalBlockerIssueId: stalledEntry.terminalBlockerIssueId ?? null,
         };
       }
       return {
@@ -2599,11 +2638,46 @@ async function listIssueBlockerAttentionMap(
     if (node.assigneeAgentId) {
       const assignee = agentsById.get(node.assigneeAgentId);
       if (!assignee || assignee.companyId !== companyId || !BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES.has(assignee.status)) {
-        return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+        return {
+          covered: false,
+          stalled: false,
+          sampleBlockerIdentifier: nodeSample,
+          sampleStalledBlockerIdentifier: null,
+          terminalBlockerIssueId: node.id,
+        };
       }
     }
 
-    return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+    return {
+      covered: false,
+      stalled: false,
+      sampleBlockerIdentifier: nodeSample,
+      sampleStalledBlockerIdentifier: null,
+      terminalBlockerIssueId: node.id,
+    };
+  };
+
+  const pathHasLiveWork = (nodeId: string, seen: Set<string>): boolean => {
+    if (seen.has(nodeId)) return false;
+    const node = nodesById.get(nodeId);
+    if (!node || node.companyId !== companyId) return false;
+    if (node.status === "in_progress" || activeIssueIds.has(node.id)) return true;
+
+    const nextSeen = new Set(seen);
+    nextSeen.add(nodeId);
+    return (edgesByIssueId.get(node.id) ?? []).some((edge) => {
+      const blocker = nodesById.get(edge.blockerIssueId);
+      if (blocker?.status === "done" && !pendingFinalizeBlockerIssueIds.has(edge.blockerIssueId)) return false;
+      return pathHasLiveWork(edge.blockerIssueId, nextSeen);
+    });
+  };
+
+  const issueIdForSample = (sample: string | null | undefined) => {
+    if (!sample) return null;
+    for (const node of nodesById.values()) {
+      if (node.id === sample || node.identifier === sample) return node.id;
+    }
+    return null;
   };
 
   for (const root of roots) {
@@ -2615,6 +2689,7 @@ async function listIssueBlockerAttentionMap(
       attentionMap.set(root.id, createIssueBlockerAttention({
         state: "needs_attention",
         reason: "attention_required",
+        terminalBlockerIssueId: root.id,
       }));
       continue;
     }
@@ -2626,13 +2701,19 @@ async function listIssueBlockerAttentionMap(
     const coveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
     const stalledBlockerCount = classified.filter((entry) => entry.result.stalled).length;
     const attentionBlockerCount = classified.length - coveredBlockerCount - stalledBlockerCount;
-    const hardAttentionEntry = classified.find((entry) => !entry.result.covered && !entry.result.stalled);
-    const stalledEntry = classified.find((entry) => entry.result.stalled);
+    const hardAttentionEntry = classified.find((entry) =>
+      !entry.result.covered && !entry.result.stalled && entry.result.terminalBlockerIssueId
+    ) ?? classified.find((entry) => !entry.result.covered && !entry.result.stalled);
+    const stalledEntry = classified.find((entry) => entry.result.stalled && entry.result.terminalBlockerIssueId)
+      ?? classified.find((entry) => entry.result.stalled);
     const sampleEntry = hardAttentionEntry ?? stalledEntry ?? classified[0] ?? null;
     const sampleNode = sampleEntry ? nodesById.get(sampleEntry.edge.blockerIssueId) : null;
     const sampleStalledFromChain = classified
       .map((entry) => entry.result.sampleStalledBlockerIdentifier)
       .find((value) => value);
+    const sampledTerminalIdentifier = sampleEntry?.result.stalled
+      ? sampleEntry.result.sampleStalledBlockerIdentifier ?? sampleEntry.result.sampleBlockerIdentifier
+      : sampleEntry?.result.sampleBlockerIdentifier ?? blockerSampleIdentifier(sampleNode);
 
     let state: IssueBlockerAttention["state"];
     let reason: IssueBlockerAttention["reason"];
@@ -2662,6 +2743,9 @@ async function listIssueBlockerAttentionMap(
       sampleBlockerIdentifier: sampleEntry?.result.sampleBlockerIdentifier ?? blockerSampleIdentifier(sampleNode),
       sampleStalledBlockerIdentifier:
         stalledEntry?.result.sampleStalledBlockerIdentifier ?? sampleStalledFromChain ?? null,
+      blockingTreeLive: topLevelEdges.some((edge) => pathHasLiveWork(edge.blockerIssueId, new Set([root.id]))),
+      terminalBlockerIssueId:
+        sampleEntry?.result.terminalBlockerIssueId ?? issueIdForSample(sampledTerminalIdentifier),
     }));
   }
 
@@ -4943,6 +5027,45 @@ export function issueService(db: Db) {
     return { comment, parent };
   }
 
+  async function archiveInbox(
+    companyId: string,
+    issueId: string,
+    userId: string,
+    archivedAt: Date = new Date(),
+    attribution?: {
+      archivedByActorType: "user" | "agent";
+      archivedByAgentId?: string | null;
+      archivedByRunId?: string | null;
+    },
+    dbOrTx: any = db,
+  ) {
+    const now = new Date();
+    const [row] = await dbOrTx
+      .insert(issueInboxArchives)
+      .values({
+        companyId,
+        issueId,
+        userId,
+        archivedByActorType: attribution?.archivedByActorType ?? "user",
+        archivedByAgentId: attribution?.archivedByAgentId ?? null,
+        archivedByRunId: attribution?.archivedByRunId ?? null,
+        archivedAt,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: [issueInboxArchives.companyId, issueInboxArchives.issueId, issueInboxArchives.userId],
+        set: {
+          archivedAt,
+          archivedByActorType: attribution?.archivedByActorType ?? "user",
+          archivedByAgentId: attribution?.archivedByAgentId ?? null,
+          archivedByRunId: attribution?.archivedByRunId ?? null,
+          updatedAt: now,
+        },
+      })
+      .returning();
+    return row;
+  }
+
   return {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
@@ -5302,43 +5425,7 @@ export function issueService(db: Db) {
       return deleted.length > 0;
     },
 
-    archiveInbox: async (
-      companyId: string,
-      issueId: string,
-      userId: string,
-      archivedAt: Date = new Date(),
-      attribution?: {
-        archivedByActorType: "user" | "agent";
-        archivedByAgentId?: string | null;
-        archivedByRunId?: string | null;
-      },
-    ) => {
-      const now = new Date();
-      const [row] = await db
-        .insert(issueInboxArchives)
-        .values({
-          companyId,
-          issueId,
-          userId,
-          archivedByActorType: attribution?.archivedByActorType ?? "user",
-          archivedByAgentId: attribution?.archivedByAgentId ?? null,
-          archivedByRunId: attribution?.archivedByRunId ?? null,
-          archivedAt,
-          updatedAt: now,
-        })
-        .onConflictDoUpdate({
-          target: [issueInboxArchives.companyId, issueInboxArchives.issueId, issueInboxArchives.userId],
-          set: {
-            archivedAt,
-            archivedByActorType: attribution?.archivedByActorType ?? "user",
-            archivedByAgentId: attribution?.archivedByAgentId ?? null,
-            archivedByRunId: attribution?.archivedByRunId ?? null,
-            updatedAt: now,
-          },
-        })
-        .returning();
-      return row;
-    },
+    archiveInbox,
 
     /**
      * Seed inbox archives for a batch of freshly imported issues so a company
@@ -7016,7 +7103,10 @@ export function issueService(db: Db) {
         actorUserId?: string | null;
       },
       dbOrTx: any = db,
+      postCommitActivityPublications?: ActivityPublication[],
     ) => {
+      const ownedActivityPublications: ActivityPublication[] = [];
+      const activityPublications = postCommitActivityPublications ?? ownedActivityPublications;
       const existing = await dbOrTx
         .select()
         .from(issues)
@@ -7353,6 +7443,35 @@ export function issueService(db: Db) {
               );
           }
         }
+        if (actorUserId && receiptExisting.status !== "done" && updated.status === "done") {
+          if (dbOrTx !== db && !postCommitActivityPublications) {
+            throw new Error("Human completion in an external transaction requires a post-commit activity queue");
+          }
+          const now = new Date();
+          const archiveState = await archiveInbox(
+            updated.companyId,
+            updated.id,
+            actorUserId,
+            now,
+            undefined,
+            tx,
+          );
+          const { publication } = await persistActivity(tx as unknown as Db, {
+            companyId: updated.companyId,
+            actorType: "user",
+            actorId: actorUserId,
+            action: "issue.inbox_archived",
+            entityType: "issue",
+            entityId: updated.id,
+            details: {
+              userId: actorUserId,
+              archivedAt: archiveState.archivedAt,
+              targetResolvedFrom: "responsible_user",
+              source: "issue_status_done",
+            },
+          });
+          activityPublications.push(publication);
+        }
         return {
           ...enriched,
           ...(nextBlockedByIssueIds !== undefined ? { blockedByIssueIds: nextBlockedByIssueIds } : {}),
@@ -7360,7 +7479,11 @@ export function issueService(db: Db) {
         };
       };
 
-      return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
+      const result = await (dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx));
+      if (dbOrTx === db && !postCommitActivityPublications) {
+        for (const publication of ownedActivityPublications) publishActivity(publication);
+      }
+      return result;
     },
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
