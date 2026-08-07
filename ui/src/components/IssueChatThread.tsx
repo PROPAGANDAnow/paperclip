@@ -773,6 +773,18 @@ function toIsoString(value: string | Date | null | undefined): string | null {
   return typeof value === "string" ? value : value.toISOString();
 }
 
+/**
+ * ISO timestamp for display, or undefined when the value does not parse as a
+ * real date. Comment timestamps can arrive malformed (e.g. a server
+ * serialization bug turning Dates into `{}`); formatting must degrade to "no
+ * timestamp" instead of throwing mid-render (PAP-16607).
+ */
+function toValidIsoString(value: Date | string | number | undefined): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
 function loadDraft(draftKey: string): string {
   try {
     return localStorage.getItem(draftKey) ?? "";
@@ -2411,6 +2423,10 @@ function isStaleSuccessfulRunHandoffNotice(input: {
   const currentHandoff = input.successfulRunHandoff ?? null;
   if (currentHandoff?.state === "resolved") return true;
   if (issueStatusIsTerminalDisposition(input.issueStatus)) return true;
+  // A live continuation (running/queued run or queued wake) means an agent is
+  // already handling the issue — fold the warning until the issue is actually
+  // stuck again.
+  if (currentHandoff?.hasLiveContinuation) return true;
 
   const noticeSourceRunId = sourceRunIdFromSuccessfulRunHandoffMetadata(input.metadata) ?? input.runId ?? null;
   if (
@@ -2733,7 +2749,7 @@ function SystemNoticeCommentRow({
         {bodyText}
       </MarkdownBody>
     ),
-    timestamp: message.createdAt ? new Date(message.createdAt).toISOString() : undefined,
+    timestamp: toValidIsoString(message.createdAt),
     source,
     runAgentId,
   });
@@ -4476,6 +4492,16 @@ export function IssueChatThread({
     () => displayLiveRuns.some((run) => run.status === "running") || activeRun?.status === "running",
     [displayLiveRuns, activeRun],
   );
+  // Real-time view of the handoff: a run that starts after the issue payload
+  // was fetched must quiet the missing-disposition warnings without waiting
+  // for a refetch to update `hasLiveContinuation`.
+  const successfulRunHandoffWithLiveness = useMemo(() => {
+    if (!successfulRunHandoff || successfulRunHandoff.hasLiveContinuation) {
+      return successfulRunHandoff ?? null;
+    }
+    const liveNow = activeRunIds.size > 0 || Boolean(issueId && liveIssueIds?.has(issueId));
+    return liveNow ? { ...successfulRunHandoff, hasLiveContinuation: true } : successfulRunHandoff;
+  }, [successfulRunHandoff, activeRunIds, issueId, liveIssueIds]);
   const clearLatestSettleTimeouts = useCallback(() => {
     for (const timeout of latestSettleTimeoutsRef.current) {
       window.clearTimeout(timeout);
@@ -4954,7 +4980,7 @@ export function IssueChatThread({
       onUploadImage: stableOnUploadImage,
       issueStatus,
       issueAssigneeAgentId,
-      successfulRunHandoff,
+      successfulRunHandoff: successfulRunHandoffWithLiveness,
       externalReferences,
       linkCaseReferences,
     }),
@@ -4983,7 +5009,7 @@ export function IssueChatThread({
       stableOnUploadImage,
       issueStatus,
       issueAssigneeAgentId,
-      successfulRunHandoff,
+      successfulRunHandoffWithLiveness,
       externalReferences,
       linkCaseReferences,
     ],
@@ -5126,7 +5152,7 @@ export function IssueChatThread({
                     allBlockers={blockedBy}
                     liveIssueIds={liveIssueIds}
                     blockerAttention={blockerAttention}
-                    successfulRunHandoff={recoveryAction ? null : successfulRunHandoff}
+                    successfulRunHandoff={recoveryAction ? null : successfulRunHandoffWithLiveness}
                     scheduledRetry={scheduledRetry}
                     agentName={
                       successfulRunHandoff?.assigneeAgentId
