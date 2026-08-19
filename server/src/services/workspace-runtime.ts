@@ -36,6 +36,16 @@ import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
+import { hasVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
+import {
+  buildManagedWorkspaceGuestEnv,
+  logManagedWorkspaceReadinessRejection,
+  probeManagedWorkspaceHandoffSubjects,
+  probeManagedWorkspaceReadiness,
+  resolveManagedWorkspaceIdentity,
+  shouldBlockPublicationOnReadiness,
+  waitForManagedWorkspaceReadiness,
+} from "./managed-workspace-identity.js";
 import {
   createLocalServiceKey,
   findLocalServiceRegistryRecordByRuntimeServiceId,
@@ -232,6 +242,8 @@ const runtimeServicesById = new Map<string, RuntimeServiceRecord>();
 const runtimeServicesByReuseKey = new Map<string, string>();
 const runtimeServiceLeasesByRun = new Map<string, string[]>();
 const runtimeProvisionByWorkspace = new Map<string, Promise<void>>();
+const runtimeControlStartByOwner = new Map<string, Promise<void>>();
+const runtimeReplacementClaimsByReuseKey = new Map<string, number>();
 const quarantinedRuntimeExposurePorts = new Set<number>();
 /**
  * Pair-atomic in-process claims for exposure allocations that have not bound a
@@ -477,6 +489,8 @@ export async function resetRuntimeServicesForTests(
   runtimeServicesByReuseKey.clear();
   runtimeServiceLeasesByRun.clear();
   runtimeProvisionByWorkspace.clear();
+  runtimeControlStartByOwner.clear();
+  runtimeReplacementClaimsByReuseKey.clear();
   quarantinedRuntimeExposurePorts.clear();
   exposurePortPairClaims.clear();
   workspaceRuntimeExposureDeps = defaultWorkspaceRuntimeExposureDeps();
@@ -4724,16 +4738,92 @@ function resolveRuntimeServiceHealthUrl(
   return url;
 }
 
+type RuntimeServiceHealthProbeInput = {
+  db?: Db;
+  serviceName?: string | null;
+  command?: string | null;
+  provider?: string | null;
+  port?: number | null;
+  /**
+   * Workspace identity, when the caller knows it. Supplying all three upgrades
+   * the probe from "the port answered with status ok" to the full protected
+   * readiness contract, which is what stops a relocated port or a half-restored
+   * clone from masquerading as healthy (PAP-17572).
+   */
+  cwd?: string | null;
+  executionWorkspaceId?: string | null;
+  companyId?: string | null;
+};
+
+/**
+ * Whether a managed workspace runtime satisfies the *user* readiness contract.
+ *
+ * Returns null when this service is not an identity-resolvable managed workspace
+ * runtime, so non-workspace services keep their existing behavior.
+ *
+ * For a workspace runtime this *replaces* the semantic transport check rather
+ * than adding to it. The probe reads the same `/api/health` response the legacy
+ * check read, so every legacy verdict is already implied: reaching
+ * `readiness_missing` means the response was `200` with `status: ok` (exactly
+ * what the legacy check asserted), and every other rejection means it was not.
+ * Stacking a second request on top would double the latency of every reuse
+ * decision for no extra information.
+ */
+async function probeManagedWorkspaceRuntimeReadiness(
+  healthUrl: string,
+  input: RuntimeServiceHealthProbeInput,
+): Promise<boolean | null> {
+  if (!isPaperclipDevRuntimeService(input)) return null;
+  const identity = resolveManagedWorkspaceIdentity({
+    workspaceCwd: input.cwd ?? null,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    companyId: input.companyId ?? null,
+  });
+  if (!identity) return null;
+
+  const result = await probeManagedWorkspaceReadiness({ healthUrl, identity });
+  const verified = !result.ok
+    ? result
+    : input.db
+      ? await probeManagedWorkspaceHandoffSubjects({ db: input.db, healthUrl, identity })
+      : {
+          ok: false as const,
+          reason: "not_ready" as const,
+          readiness: result.readiness,
+          detail: "control-plane database is unavailable for board identity verification",
+        };
+  if (verified.ok) return true;
+  logManagedWorkspaceReadinessRejection({
+    executionWorkspaceId: identity.executionWorkspaceId,
+    healthUrl,
+    result: verified,
+  });
+  // A guest that does not implement the readiness contract yet is not evidence of
+  // an unhealthy clone; it is only evidence that the contract cannot be checked.
+  return !shouldBlockPublicationOnReadiness(verified);
+}
+
 async function isRuntimeServiceUrlHealthy(
   url: string | null,
-  input?: { serviceName?: string | null; command?: string | null },
+  input?: RuntimeServiceHealthProbeInput,
 ) {
-  if (!url) return true;
-  const healthUrl = resolveRuntimeServiceHealthUrl(url, input);
+  const localProbeUrl = input?.provider === "local_process" && input.port && isPaperclipDevRuntimeService(input)
+    ? `http://127.0.0.1:${input.port}`
+    : null;
+  const probeUrl = localProbeUrl ?? url;
+  if (!probeUrl) return true;
+  const healthUrl = resolveRuntimeServiceHealthUrl(probeUrl, input);
   if (!healthUrl) return false;
+
+  const readiness = await probeManagedWorkspaceRuntimeReadiness(healthUrl, input ?? {});
+  if (readiness !== null) return readiness;
+
   try {
     const response = await fetch(healthUrl, { signal: AbortSignal.timeout(2_000) });
-    return response.ok;
+    if (!response.ok) return false;
+    if (!isPaperclipDevRuntimeService(input ?? {})) return true;
+    const payload = await response.json().catch(() => null) as { status?: unknown } | null;
+    return payload?.status === "ok";
   } catch {
     return false;
   }
@@ -4999,6 +5089,7 @@ export function resolveRuntimeProvisionCommand(input: {
   if (input.workspace.strategy !== "git_worktree") return "";
 
   const stateDir = path.join(input.workspace.cwd, ".paperclip");
+  const manifestPath = path.join(stateDir, "seed-manifest.json");
   const pendingMarker = path.join(stateDir, "seed-pending");
   const completeMarker = path.join(stateDir, "seed-complete");
   const provisionScript = path.join(
@@ -5006,11 +5097,11 @@ export function resolveRuntimeProvisionCommand(input: {
     "scripts",
     "provision-worktree-runtime.sh",
   );
-  if (
-    !existsSync(pendingMarker)
-    || existsSync(completeMarker)
-    || !existsSync(provisionScript)
-  ) {
+  let needsSeed = existsSync(pendingMarker) && !existsSync(completeMarker);
+  if (existsSync(manifestPath)) {
+    needsSeed = !hasVerifiedWorktreeSeedManifest(manifestPath);
+  }
+  if (!needsSeed || !existsSync(provisionScript)) {
     return "";
   }
 
@@ -5355,6 +5446,21 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     env[portEnvKey] = String(port);
   }
 
+  // Per-workspace handoff key, readiness token, and workspace id. Injected for
+  // the Paperclip dev runtime whether or not it is HTTPS-exposed, because the
+  // password-independent login handoff and the protected readiness probe are
+  // both needed for a plain-HTTP loopback workspace too (PAP-17572).
+  const managedWorkspaceIdentity = isPaperclipDevRuntimeService({ serviceName, command })
+    ? resolveManagedWorkspaceIdentity({
+        workspaceCwd: input.workspace.cwd,
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        companyId: input.agent.companyId,
+      })
+    : null;
+  if (managedWorkspaceIdentity) {
+    Object.assign(env, buildManagedWorkspaceGuestEnv(managedWorkspaceIdentity));
+  }
+
   if (exposureConfig) {
     // Paperclip dev-runtime-specific hardening. Other managed processes are
     // still rejected by the broker unless /proc proves loopback-only listeners.
@@ -5410,7 +5516,14 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
   });
   if (adoptedRecord) {
     const adoptedUrl = adoptedRecord.url ?? backendUrl;
-    if (!(await isRuntimeServiceUrlHealthy(adoptedUrl, { serviceName, command }))) {
+    if (!(await isRuntimeServiceUrlHealthy(adoptedUrl, {
+      db: input.db,
+      serviceName,
+      command,
+      cwd: input.workspace.cwd,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+      companyId: input.agent.companyId,
+    }))) {
       await terminateLocalService(adoptedRecord);
       await removeLocalServiceRegistryRecord(adoptedRecord.serviceKey);
     } else {
@@ -5682,6 +5795,45 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         );
       }
     }
+    // Transport readiness only proves a listener answered. A managed workspace
+    // must additionally satisfy the protected readiness contract — own database,
+    // cloned rows, login handoff, and matching instance/workspace identity —
+    // before it may be published as running/healthy (PAP-17572).
+    if (managedWorkspaceIdentity) {
+      const publishHealthUrl = resolveRuntimeServiceHealthUrl(
+        record.port ? `http://127.0.0.1:${record.port}` : rewriteUrlHostToLoopback(record.url ?? backendUrl),
+        { serviceName, command },
+      );
+      if (!publishHealthUrl) {
+        throw new Error("Managed workspace readiness gate could not resolve a health URL");
+      }
+      let gate = await waitForManagedWorkspaceReadiness({
+        healthUrl: publishHealthUrl,
+        identity: managedWorkspaceIdentity,
+      });
+      if (gate.ok) {
+        if (!record.db) {
+          throw new Error("Managed workspace readiness gate could not resolve the control-plane database");
+        }
+        gate = await probeManagedWorkspaceHandoffSubjects({
+          db: record.db,
+          healthUrl: publishHealthUrl,
+          identity: managedWorkspaceIdentity,
+        });
+      }
+      if (!gate.ok) {
+        logManagedWorkspaceReadinessRejection({
+          executionWorkspaceId: managedWorkspaceIdentity.executionWorkspaceId,
+          healthUrl: publishHealthUrl,
+          result: gate,
+        });
+        if (shouldBlockPublicationOnReadiness(gate)) {
+          throw new Error(
+            `Workspace is not ready to publish (${gate.reason}${gate.detail ? `: ${gate.detail}` : ""})`,
+          );
+        }
+      }
+    }
     record.status = "running";
     record.healthStatus = "healthy";
     record.lastUsedAt = new Date().toISOString();
@@ -5929,6 +6081,41 @@ async function stopRuntimeService(serviceId: string) {
   }
   await removeLocalServiceRegistryRecord(record.serviceKey);
   await persistRuntimeServiceRecord(record.db, record);
+}
+
+async function findHealthyRunningRuntimeService(reuseKey: string | null) {
+  const existingId = reuseKey ? runtimeServicesByReuseKey.get(reuseKey) : null;
+  const existing = existingId ? runtimeServicesById.get(existingId) : null;
+  if (!existing || existing.status !== "running") return null;
+  const healthInput = {
+    db: existing.db,
+    serviceName: existing.serviceName,
+    command: existing.command,
+    provider: existing.provider,
+    port: existing.port,
+    cwd: existing.cwd,
+    executionWorkspaceId: existing.executionWorkspaceId,
+    companyId: existing.companyId,
+  };
+  let healthy = await isRuntimeServiceUrlHealthy(existing.url, healthInput);
+  if (!healthy) {
+    // A single timeout or connection reset is not enough evidence to destroy a
+    // shared runtime that active runs may still use. Confirm the failure after
+    // a short bounded delay before entering the destructive replacement path.
+    await delay(250);
+    healthy = await isRuntimeServiceUrlHealthy(existing.url, healthInput);
+  }
+  if (healthy) return existing;
+  if (existing.leaseRunIds.size > 0) {
+    existing.healthStatus = "unhealthy";
+    if (reuseKey && runtimeServicesByReuseKey.get(reuseKey) === existing.id) {
+      runtimeServicesByReuseKey.delete(reuseKey);
+    }
+    await persistRuntimeServiceRecord(existing.db, existing);
+    return null;
+  }
+  await stopRuntimeService(existing.id);
+  return null;
 }
 
 async function markPersistedRuntimeServicesStoppedForExecutionWorkspace(input: {
@@ -6254,7 +6441,7 @@ async function isPersistedIsolatedExecutionWorkspace(input: {
   return row?.mode === "isolated_workspace";
 }
 
-export async function ensureRuntimeServicesForRun(input: {
+type EnsureRuntimeServicesForRunInput = {
   db?: Db;
   runId: string;
   agent: ExecutionWorkspaceAgentRef;
@@ -6265,7 +6452,11 @@ export async function ensureRuntimeServicesForRun(input: {
   adapterEnv: Record<string, string>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   recorder?: WorkspaceOperationRecorder | null;
-}): Promise<RuntimeServiceRef[]> {
+};
+
+async function ensureRuntimeServicesForRunInvocation(
+  input: EnsureRuntimeServicesForRunInput,
+): Promise<RuntimeServiceRef[]> {
   const rawServices = selectRuntimeServiceEntries({
     config: input.config,
     respectDesiredStates: true,
@@ -6304,9 +6495,8 @@ export async function ensureRuntimeServicesForRun(input: {
       }).reuseKey;
 
       if (reuseKey) {
-        const existingId = runtimeServicesByReuseKey.get(reuseKey);
-        const existing = existingId ? runtimeServicesById.get(existingId) : null;
-        if (existing && existing.status === "running") {
+        const existing = await findHealthyRunningRuntimeService(reuseKey);
+        if (existing) {
           existing.leaseRunIds.add(input.runId);
           existing.lastUsedAt = new Date().toISOString();
           existing.stoppedAt = null;
@@ -6352,6 +6542,124 @@ export async function ensureRuntimeServicesForRun(input: {
   }
 
   return refs;
+}
+
+async function withRuntimeStartMutex<T>(ownerKey: string, start: () => Promise<T>): Promise<T> {
+  const previous = runtimeControlStartByOwner.get(ownerKey) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(() => current);
+  runtimeControlStartByOwner.set(ownerKey, queued);
+  await previous;
+  try {
+    return await start();
+  } finally {
+    release();
+    if (runtimeControlStartByOwner.get(ownerKey) === queued) runtimeControlStartByOwner.delete(ownerKey);
+  }
+}
+
+function resolveRuntimeStartMutexPlan(input: {
+  services: Array<Record<string, unknown>>;
+  workspace: RealizedExecutionWorkspace;
+  executionWorkspaceId?: string | null;
+  issue: ExecutionWorkspaceIssueRef | null;
+  runId: string;
+  agent: ExecutionWorkspaceAgentRef;
+  adapterEnv: Record<string, string>;
+}) {
+  const fallbackOwnerId = input.executionWorkspaceId
+    ?? input.workspace.workspaceId
+    ?? path.resolve(input.workspace.cwd);
+  const replacementReuseKeys: string[] = [];
+  const keys = input.services.map((service) => {
+    const { scopeType, scopeId } = resolveServiceScopeId({
+      service,
+      workspace: input.workspace,
+      executionWorkspaceId: input.executionWorkspaceId,
+      issue: input.issue,
+      runId: input.runId,
+      agent: input.agent,
+    });
+    const reuseKey = resolveRuntimeServiceReuseIdentity({
+      service,
+      workspace: input.workspace,
+      agent: input.agent,
+      issue: input.issue,
+      adapterEnv: input.adapterEnv,
+      scopeType,
+      scopeId,
+    }).reuseKey;
+    // Converge all callers that can replace an existing shared runtime on its
+    // reuse identity. For an initial start, retain owner-level concurrency so
+    // the exposure allocator's in-flight pair claims remain authoritative.
+    if (
+      reuseKey
+      && (runtimeServicesByReuseKey.has(reuseKey) || runtimeReplacementClaimsByReuseKey.has(reuseKey))
+    ) {
+      runtimeReplacementClaimsByReuseKey.set(
+        reuseKey,
+        (runtimeReplacementClaimsByReuseKey.get(reuseKey) ?? 0) + 1,
+      );
+      replacementReuseKeys.push(reuseKey);
+      return `reuse:${reuseKey}`;
+    }
+    return `${input.agent.companyId}:owner:${fallbackOwnerId}`;
+  });
+  return {
+    ownerKeys: [...new Set(keys)].sort(),
+    replacementReuseKeys,
+  };
+}
+
+function releaseRuntimeReplacementClaims(reuseKeys: string[]) {
+  for (const reuseKey of reuseKeys) {
+    const next = (runtimeReplacementClaimsByReuseKey.get(reuseKey) ?? 1) - 1;
+    if (next <= 0) runtimeReplacementClaimsByReuseKey.delete(reuseKey);
+    else runtimeReplacementClaimsByReuseKey.set(reuseKey, next);
+  }
+}
+
+async function withRuntimeStartMutexes<T>(
+  ownerKeys: string[],
+  start: () => Promise<T>,
+): Promise<T> {
+  const acquire = async (index: number): Promise<T> => {
+    const ownerKey = ownerKeys[index];
+    if (!ownerKey) return await start();
+    return await withRuntimeStartMutex(ownerKey, () => acquire(index + 1));
+  };
+  return await acquire(0);
+}
+
+export async function ensureRuntimeServicesForRun(
+  input: EnsureRuntimeServicesForRunInput,
+): Promise<RuntimeServiceRef[]> {
+  const services = selectRuntimeServiceEntries({
+    config: input.config,
+    respectDesiredStates: true,
+    defaultDesiredState: readDesiredRuntimeState(input.config.desiredState) ?? "running",
+    serviceStates: readConfiguredServiceStates(input.config),
+  });
+  const mutexPlan = resolveRuntimeStartMutexPlan({
+    services,
+    workspace: input.workspace,
+    executionWorkspaceId: input.executionWorkspaceId,
+    issue: input.issue,
+    runId: input.runId,
+    agent: input.agent,
+    adapterEnv: input.adapterEnv,
+  });
+  try {
+    return await withRuntimeStartMutexes(
+      mutexPlan.ownerKeys,
+      () => ensureRuntimeServicesForRunInvocation(input),
+    );
+  } finally {
+    releaseRuntimeReplacementClaims(mutexPlan.replacementReuseKeys);
+  }
 }
 
 type StartRuntimeServicesForWorkspaceControlInput = {
@@ -6417,9 +6725,8 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
     }).reuseKey;
 
     if (reuseKey) {
-      const existingId = runtimeServicesByReuseKey.get(reuseKey);
-      const existing = existingId ? runtimeServicesById.get(existingId) : null;
-      if (existing && existing.status === "running") {
+      const existing = await findHealthyRunningRuntimeService(reuseKey);
+      if (existing) {
         const prepared = options?.preparedProvisioning;
         if (prepared?.service === service && prepared.record.id !== existing.id && persistenceDb) {
           await persistenceDb
@@ -6543,7 +6850,7 @@ async function discardFailedDeferredRuntimeStart(db: Db, record: RuntimeServiceR
   await persistRuntimeServiceRecord(db, record);
 }
 
-export async function startRuntimeServicesForWorkspaceControl(
+async function startRuntimeServicesForWorkspaceControlInvocation(
   input: StartRuntimeServicesForWorkspaceControlInput,
 ): Promise<RuntimeServiceRef[]> {
   const rawServices = selectRuntimeServiceEntries({
@@ -6608,9 +6915,8 @@ export async function startRuntimeServicesForWorkspaceControl(
           scopeType,
           scopeId,
         }).reuseKey;
-        const existingId = reuseKey ? runtimeServicesByReuseKey.get(reuseKey) : null;
-        const existing = existingId ? runtimeServicesById.get(existingId) : null;
-        if (existing?.status === "running") continue;
+        const existing = await findHealthyRunningRuntimeService(reuseKey);
+        if (existing) continue;
 
         const record = await prepareRuntimeProvisioning({
           db: input.db,
@@ -6762,6 +7068,36 @@ export async function startRuntimeServicesForWorkspaceControl(
   }
 }
 
+export async function startRuntimeServicesForWorkspaceControl(
+  input: StartRuntimeServicesForWorkspaceControlInput,
+): Promise<RuntimeServiceRef[]> {
+  const services = selectRuntimeServiceEntries({
+    config: input.config,
+    serviceIndex: input.serviceIndex,
+    respectDesiredStates: input.respectDesiredStates,
+    defaultDesiredState: readDesiredRuntimeState(input.config.desiredState) ?? "stopped",
+    serviceStates: readConfiguredServiceStates(input.config),
+  });
+  const invocationId = input.invocationId ?? "workspace_control";
+  const mutexPlan = resolveRuntimeStartMutexPlan({
+    services,
+    workspace: input.workspace,
+    executionWorkspaceId: input.executionWorkspaceId,
+    issue: input.issue,
+    runId: invocationId,
+    agent: input.actor,
+    adapterEnv: input.adapterEnv,
+  });
+  try {
+    return await withRuntimeStartMutexes(
+      mutexPlan.ownerKeys,
+      () => startRuntimeServicesForWorkspaceControlInvocation(input),
+    );
+  } finally {
+    releaseRuntimeReplacementClaims(mutexPlan.replacementReuseKeys);
+  }
+}
+
 export async function releaseRuntimeServicesForRun(runId: string) {
   const acquired = runtimeServiceLeasesByRun.get(runId) ?? [];
   runtimeServiceLeasesByRun.delete(runId);
@@ -6773,7 +7109,14 @@ export async function releaseRuntimeServicesForRun(runId: string) {
     const stopType = asString(record.stopPolicy?.type, record.lifecycle === "ephemeral" ? "on_run_finish" : "manual");
     await persistRuntimeServiceRecord(record.db, record);
     if (record.leaseRunIds.size === 0) {
-      if (record.lifecycle === "ephemeral" || stopType === "on_run_finish") {
+      const detachedUnhealthySharedRuntime = record.healthStatus === "unhealthy"
+        && Boolean(record.reuseKey)
+        && runtimeServicesByReuseKey.get(record.reuseKey!) !== record.id;
+      if (
+        record.lifecycle === "ephemeral"
+        || stopType === "on_run_finish"
+        || detachedUnhealthySharedRuntime
+      ) {
         await stopRuntimeService(serviceId);
         continue;
       }
@@ -7004,6 +7347,64 @@ async function buildPersistedRuntimeExposureIntentLookup(db: Db) {
   };
 }
 
+export async function refreshPersistedRuntimeServiceHealth(input: {
+  db: Db;
+  companyId: string;
+  executionWorkspaceId: string;
+  projectWorkspaceId?: string | null;
+}) {
+  const ownershipCondition = input.projectWorkspaceId
+    ? or(
+        eq(workspaceRuntimeServices.executionWorkspaceId, input.executionWorkspaceId),
+        and(
+          eq(workspaceRuntimeServices.projectWorkspaceId, input.projectWorkspaceId),
+          eq(workspaceRuntimeServices.scopeType, "project_workspace"),
+        ),
+      )
+    : eq(workspaceRuntimeServices.executionWorkspaceId, input.executionWorkspaceId);
+  const rows = await input.db
+    .select({
+      id: workspaceRuntimeServices.id,
+      serviceName: workspaceRuntimeServices.serviceName,
+      command: workspaceRuntimeServices.command,
+      provider: workspaceRuntimeServices.provider,
+      port: workspaceRuntimeServices.port,
+      url: workspaceRuntimeServices.url,
+      healthStatus: workspaceRuntimeServices.healthStatus,
+      cwd: workspaceRuntimeServices.cwd,
+      executionWorkspaceId: workspaceRuntimeServices.executionWorkspaceId,
+      companyId: workspaceRuntimeServices.companyId,
+    })
+    .from(workspaceRuntimeServices)
+    .where(and(
+      eq(workspaceRuntimeServices.companyId, input.companyId),
+      eq(workspaceRuntimeServices.provider, "local_process"),
+      eq(workspaceRuntimeServices.status, "running"),
+      ownershipCondition,
+    ));
+  const results = await Promise.all(rows.map(async (row) => ({
+    row,
+    healthStatus: await isRuntimeServiceUrlHealthy(row.url, { ...row, db: input.db })
+      ? "healthy" as const
+      : "unhealthy" as const,
+  })));
+  await Promise.all(results.map(async ({ row, healthStatus }) => {
+    const liveRecord = runtimeServicesById.get(row.id);
+    if (liveRecord) liveRecord.healthStatus = healthStatus;
+    if (row.healthStatus === healthStatus) return;
+    await input.db.update(workspaceRuntimeServices).set({ healthStatus, updatedAt: new Date() }).where(and(
+      eq(workspaceRuntimeServices.id, row.id),
+      eq(workspaceRuntimeServices.companyId, input.companyId),
+      eq(workspaceRuntimeServices.status, "running"),
+    ));
+  }));
+  return {
+    checked: results.length,
+    healthy: results.filter((result) => result.healthStatus === "healthy").length,
+    unhealthy: results.filter((result) => result.healthStatus === "unhealthy").length,
+  };
+}
+
 export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
   const rows = await db
     .select()
@@ -7185,7 +7586,16 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
       if (
         backfillDecision.action === "reprovision"
         || !exposureHealthMatches
-        || !(await isRuntimeServiceUrlHealthy(adoptedUrl, { serviceName: row.serviceName, command: row.command }))
+        || !(await isRuntimeServiceUrlHealthy(adoptedUrl, {
+          db,
+          serviceName: row.serviceName,
+          command: row.command,
+          provider: "local_process",
+          port: adoptedRecord.port ?? row.port,
+          cwd: row.cwd,
+          executionWorkspaceId: row.executionWorkspaceId ?? null,
+          companyId: row.companyId,
+        }))
       ) {
         if (backfillDecision.action === "reprovision") backfilled += 1;
         await terminateLocalService(adoptedRecord);

@@ -134,6 +134,17 @@ async function runPnpm(cwd: string, args: string[]) {
   await execFileAsync("pnpm", args, { cwd });
 }
 
+async function writeRegisteredSourceConfig(baseCwd: string, instanceId = "source-instance") {
+  const configDir = path.join(baseCwd, ".paperclip");
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.writeFile(path.join(configDir, "config.json"), "{}\n", "utf8");
+  await fs.writeFile(
+    path.join(configDir, ".env"),
+    `PAPERCLIP_INSTANCE_ID=${instanceId}\n`,
+    "utf8",
+  );
+}
+
 async function createTempRepo(defaultBranch = "main") {
   const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-repo-"));
   await runGit(repoRoot, ["init"]);
@@ -455,6 +466,39 @@ describe("resolveRuntimeProvisionCommand", () => {
       })).toBe("./custom-provision.sh");
 
       await fs.writeFile(path.join(cwd, ".paperclip", "seed-complete"), "{}\n");
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ version: 2, state: "failed" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ version: 2, state: "verified" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({
+          version: 2,
+          source: { instanceId: "source", configPath: "/source/config.json" },
+          snapshotAt: "2026-08-18T00:00:00.000Z",
+          seedMode: "full",
+          migrationRevision: "0001",
+          targetInstanceId: "target",
+          phase: "complete",
+          state: "verified",
+          attemptId: "attempt",
+          startedAt: "2026-08-18T00:00:00.000Z",
+          finishedAt: "2026-08-18T00:01:00.000Z",
+          diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+        }),
+      );
       expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
     } finally {
       await fs.rm(baseCwd, { recursive: true, force: true });
@@ -1373,8 +1417,13 @@ describe("realizeExecutionWorkspace", () => {
 
   it("writes an isolated repo-local Paperclip config and worktree branding when provisioning", async () => {
     const repoRoot = await createTempRepo();
+    await writeRegisteredSourceConfig(repoRoot, "worktree-base-source");
     const previousCwd = process.cwd();
     const previousPath = process.env.PATH;
+    const previousConfig = process.env.PAPERCLIP_CONFIG;
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const previousWorktreesDir = process.env.PAPERCLIP_WORKTREES_DIR;
     const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-home-"));
     const isolatedWorktreeHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktrees-"));
     const isolatedBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-bin-"));
@@ -1386,6 +1435,7 @@ describe("realizeExecutionWorkspace", () => {
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = instanceId;
     process.env.PAPERCLIP_WORKTREES_DIR = isolatedWorktreeHome;
+    delete process.env.PAPERCLIP_CONFIG;
     // Keep this server-side fixture on provision-worktree.sh's config writer path;
     // CLI/database seeding is covered by the CLI worktree tests.
     await fs.symlink(process.execPath, path.join(isolatedBin, "node"));
@@ -1557,6 +1607,18 @@ describe("realizeExecutionWorkspace", () => {
       } else {
         process.env.PATH = previousPath;
       }
+      for (const [key, value] of [
+        ["PAPERCLIP_CONFIG", previousConfig],
+        ["PAPERCLIP_HOME", previousHome],
+        ["PAPERCLIP_INSTANCE_ID", previousInstanceId],
+        ["PAPERCLIP_WORKTREES_DIR", previousWorktreesDir],
+      ] as const) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
     }
   }, 15_000);
 
@@ -1564,6 +1626,7 @@ describe("realizeExecutionWorkspace", () => {
     "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
     async () => {
     const repoRoot = await createTempRepo();
+    await writeRegisteredSourceConfig(repoRoot);
     await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
     await fs.mkdir(path.join(repoRoot, "packages", "shared"), { recursive: true });
     await fs.mkdir(path.join(repoRoot, "server"), { recursive: true });
@@ -1666,6 +1729,7 @@ describe("realizeExecutionWorkspace", () => {
 
   it("provisions successfully when install is needed but there are no symlinked node_modules to move", async () => {
     const repoRoot = await createTempRepo();
+    await writeRegisteredSourceConfig(repoRoot);
     await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
     await fs.writeFile(
       path.join(repoRoot, "package.json"),
@@ -1748,6 +1812,7 @@ describe("realizeExecutionWorkspace", () => {
 
     try {
       await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
+      await writeRegisteredSourceConfig(baseRoot);
       await fs.mkdir(path.join(worktreeRoot, "node_modules"), { recursive: true });
       await fs.mkdir(path.join(worktreeRoot, "ui"), { recursive: true });
       await fs.mkdir(fakeBin, { recursive: true });
@@ -1840,6 +1905,7 @@ describe("realizeExecutionWorkspace", () => {
 
     try {
       await fs.mkdir(baseRoot, { recursive: true });
+      await writeRegisteredSourceConfig(baseRoot);
       await fs.mkdir(worktreeRoot, { recursive: true });
       await fs.mkdir(fakeBin, { recursive: true });
       await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
@@ -1897,6 +1963,7 @@ describe("realizeExecutionWorkspace", () => {
 
     try {
       await fs.mkdir(baseRoot, { recursive: true });
+      await writeRegisteredSourceConfig(baseRoot);
       await fs.mkdir(paperclipDir, { recursive: true });
       await fs.mkdir(fakeBin, { recursive: true });
       await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
@@ -1987,6 +2054,7 @@ describe("realizeExecutionWorkspace", () => {
 
     try {
       await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
+      await writeRegisteredSourceConfig(baseRoot);
       await fs.mkdir(worktreeRoot, { recursive: true });
       await fs.mkdir(fakeBin, { recursive: true });
       await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
@@ -2056,6 +2124,7 @@ describe("realizeExecutionWorkspace", () => {
     "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
     async () => {
     const repoRoot = await createTempRepo();
+    await writeRegisteredSourceConfig(repoRoot);
     await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
     await fs.mkdir(path.join(repoRoot, "packages", "shared"), { recursive: true });
     await fs.mkdir(path.join(repoRoot, "server"), { recursive: true });
@@ -3919,6 +3988,86 @@ describe("ensureRuntimeServicesForRun", () => {
     }
   });
 
+  it("replaces a reused Paperclip dev runtime whose 2xx health payload is unhealthy", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-misreported-health-"));
+    const workspace = buildWorkspace(workspaceRoot);
+    const serviceCommand =
+      "node -e \"let healthy=true;const http=require('node:http');http.createServer((req,res)=>{if(req.url==='/misreport'){healthy=false;res.end('failed');return;}if(req.url==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify(healthy?{status:'ok'}:{status:'unhealthy',error:'database_unreachable'}));return;}res.end('ok')}).listen(Number(process.env.PORT),'127.0.0.1')\"";
+    const input = {
+      actor: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      issue: null,
+      workspace,
+      executionWorkspaceId: "execution-workspace-health",
+      config: { workspaceRuntime: { services: [{
+        name: "paperclip-dev",
+        command: serviceCommand,
+        cwd: ".",
+        port: { type: "auto" as const },
+        readiness: { type: "http" as const, urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 3, intervalMs: 100 },
+        expose: { type: "url" as const, urlTemplate: "http://127.0.0.1:{{port}}" },
+        lifecycle: "shared" as const,
+        stopPolicy: { type: "manual" as const },
+      }] } },
+      adapterEnv: {},
+    };
+    try {
+      const [first] = await startRuntimeServicesForWorkspaceControl(input);
+      await expect(fetch(`${first!.url}/misreport`)).resolves.toMatchObject({ ok: true });
+      await expect(fetch(`${first!.url}/api/health`)).resolves.toMatchObject({ ok: true });
+      const [[replacement], [concurrentReuse]] = await Promise.all([
+        startRuntimeServicesForWorkspaceControl(input),
+        startRuntimeServicesForWorkspaceControl(input),
+      ]);
+      expect(replacement?.id).not.toBe(first?.id);
+      expect(replacement?.reused).toBe(false);
+      expect(concurrentReuse?.id).toBe(replacement?.id);
+      expect(concurrentReuse?.reused).toBe(true);
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({
+        executionWorkspaceId: "execution-workspace-health",
+        workspaceCwd: workspaceRoot,
+      });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses a shared Paperclip dev runtime after one transient unhealthy response", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-transient-health-"));
+    const workspace = buildWorkspace(workspaceRoot);
+    const serviceCommand =
+      "node -e \"let failNext=false;const http=require('node:http');http.createServer((req,res)=>{if(req.url==='/fail-next'){failNext=true;res.end('armed');return;}if(req.url==='/api/health'){res.setHeader('content-type','application/json');const healthy=!failNext;failNext=false;res.end(JSON.stringify({status:healthy?'ok':'unhealthy'}));return;}res.end('ok')}).listen(Number(process.env.PORT),'127.0.0.1')\"";
+    const input = {
+      actor: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      issue: null,
+      workspace,
+      executionWorkspaceId: "execution-workspace-transient-health",
+      config: { workspaceRuntime: { services: [{
+        name: "paperclip-dev",
+        command: serviceCommand,
+        cwd: ".",
+        port: { type: "auto" as const },
+        readiness: { type: "http" as const, urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 3, intervalMs: 100 },
+        expose: { type: "url" as const, urlTemplate: "http://127.0.0.1:{{port}}" },
+        lifecycle: "shared" as const,
+        stopPolicy: { type: "manual" as const },
+      }] } },
+      adapterEnv: {},
+    };
+    try {
+      const [first] = await startRuntimeServicesForWorkspaceControl(input);
+      await expect(fetch(`${first!.url}/fail-next`)).resolves.toMatchObject({ ok: true });
+      const [reused] = await startRuntimeServicesForWorkspaceControl(input);
+      expect(reused?.id).toBe(first?.id);
+      expect(reused?.reused).toBe(true);
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({
+        executionWorkspaceId: "execution-workspace-transient-health",
+        workspaceCwd: workspaceRoot,
+      });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
   it("uses explicit readiness URL when exposed URL is not the local probe address", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-explicit-readiness-"));
     const workspace = buildWorkspace(workspaceRoot);
@@ -4085,8 +4234,10 @@ describe("ensureRuntimeServicesForRun", () => {
       branchName: "PAP-874-chat-speed-issues",
       worktreePath: worktreeWorkspaceRoot,
     };
+    // A Paperclip dev runtime must answer `/api/health` semantically before it may
+    // be published, so the fake serves the same shape a real one does.
     const serviceCommand =
-      "node -e \"require('node:http').createServer((req,res)=>res.end(process.env.PAPERCLIP_HOME)).listen(Number(process.env.PORT), '127.0.0.1')\"";
+      "node -e \"require('node:http').createServer((req,res)=>{if(req.url==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify({status:'ok'}));return;}res.end(process.env.PAPERCLIP_HOME)}).listen(Number(process.env.PORT), '127.0.0.1')\"";
     const config = {
       workspaceRuntime: {
         services: [
@@ -5971,7 +6122,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const delayedHmrScript = [
       "const http=require('node:http');",
       "const port=Number(process.env.PORT);",
-      "http.createServer((_req,res)=>res.end('ok')).listen(port,'127.0.0.1');",
+      "http.createServer((req,res)=>{if(req.url==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify({status:'ok'}));return;}res.end('ok')}).listen(port,'127.0.0.1');",
       "setTimeout(()=>http.createServer((_req,res)=>res.end('hmr')).listen(port+10000,'127.0.0.1'),750);",
       "setInterval(()=>{},1000);",
     ].join("");
@@ -6803,7 +6954,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     const projectWorkspaceId = randomUUID();
     // Binds the app port and its HMR companion, both loopback-only.
     const command =
-      "node -e \"const http=require('node:http');const p=Number(process.env.PORT);for(const q of [p,p+10000])http.createServer((req,res)=>res.end('ok')).listen(q,'127.0.0.1');setInterval(()=>{},1000)\"";
+      "node -e \"const http=require('node:http');const p=Number(process.env.PORT);for(const q of [p,p+10000])http.createServer((req,res)=>{if(req.url==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify({status:'ok'}));return;}res.end('ok')}).listen(q,'127.0.0.1');setInterval(()=>{},1000)\"";
     const workspaceRuntime = {
       services: [
         {
@@ -7112,7 +7263,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     const executionWorkspaceId = randomUUID();
     const stoppedServiceId = randomUUID();
     const serviceCommand =
-      "node -e \"const http=require('node:http'); const stale=process.env.STALE_HEALTH==='1'; http.createServer((req,res)=>{ if (req.url==='/api/health' && stale) { res.statusCode=503; res.end('database_unreachable'); return; } res.end('ok'); }).listen(Number(process.env.PORT), '127.0.0.1')\"";
+      "node -e \"const http=require('node:http'); const stale=process.env.STALE_HEALTH==='1'; http.createServer((req,res)=>{ if (req.url==='/api/health') { if (stale) { res.statusCode=503; res.end('database_unreachable'); return; } res.setHeader('content-type','application/json'); res.end(JSON.stringify({status:'ok'})); return; } res.end('ok'); }).listen(Number(process.env.PORT), '127.0.0.1')\"";
     const scopeType = "agent";
     const scopeId = agentId;
     const reuseKey = createHash("sha256")
