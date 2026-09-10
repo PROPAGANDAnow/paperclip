@@ -507,6 +507,7 @@ export type {
   ToolConnectionCredentialSource,
   ToolConnectionCredentialPolicy,
   ToolConnectionOwnership,
+  ToolConnectionPurpose,
   ToolConnectionTransport,
   ToolConnectionStatus,
   ToolConnectionKind,
@@ -788,6 +789,7 @@ export type {
 export type {
   IssueTreeControlPreview,
   IssueTreeHold,
+  ReleaseIssueTreeHoldResponse,
   IssueTreeHoldMember,
   IssueTreeHoldReleasePolicy,
   IssueTreePreviewAgent,

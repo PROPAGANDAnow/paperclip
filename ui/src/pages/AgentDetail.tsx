@@ -1264,7 +1264,6 @@ export function AgentDetail() {
             agent={agent}
             companyId={resolvedCompanyId}
             assignLabel="Assign Task"
-            showRun={false}
             showStatus={false}
             canRunWithProviderTrace={canUseProviderTrace}
             actionsDisabled={agentAction.isPending}
@@ -3276,7 +3275,8 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
     },
   });
 
-  const canRetryRun = run.status === "failed" || run.status === "timed_out";
+  const canRetryRun = (run.status === "failed" || run.status === "timed_out")
+    && run.execution?.phase !== "recovery_needed" && !run.execution?.successorRunId;
   const retryPayload = useMemo(() => {
     const payload: Record<string, unknown> = {};
     const context = asRecord(run.contextSnapshot);
